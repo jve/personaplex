@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -49,6 +50,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+from .session_manager import SessionManager
 
 
 logger = setup_logger(__name__)
@@ -96,7 +98,8 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 session_manager_cfg: Optional[dict] = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -112,6 +115,9 @@ class ServerState:
         )
         
         self.lock = asyncio.Lock()
+        self.notify_queue: asyncio.Queue = asyncio.Queue()
+        self.sse_subscribers: set = set()
+        self.session_manager_cfg: Optional[dict] = session_manager_cfg  # None → disabled
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
@@ -131,6 +137,52 @@ class ServerState:
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
+
+    async def handle_sse(self, request):
+        """Server-Sent Events endpoint — clients subscribe here for proactive wake events."""
+        response = web.StreamResponse(headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+        })
+        await response.prepare(request)
+        q: asyncio.Queue = asyncio.Queue()
+        self.sse_subscribers.add(q)
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=20.0)
+                    await response.write(f"data: {data}\n\n".encode())
+                    await response.drain()
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    await response.drain()
+        except Exception:
+            pass
+        finally:
+            self.sse_subscribers.discard(q)
+        return response
+
+    async def handle_notify(self, request):
+        """POST /api/notify — external systems inject an event for Odin to speak."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON")
+        text = body.get("text", "").strip()
+        if not text:
+            return web.Response(status=400, text="Missing 'text' field")
+        # Queue for the active audio session's event_loop to consume
+        await self.notify_queue.put(text)
+        # Wake any idle SSE subscribers so the client can start a session
+        event_json = json.dumps({"type": "wake", "text": text})
+        for q in list(self.sse_subscribers):
+            try:
+                q.put_nowait(event_json)
+            except asyncio.QueueFull:
+                pass
+        return web.Response(status=200, text="ok")
 
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
@@ -201,13 +253,72 @@ class ServerState:
                 close = True
                 clog.log("info", "connection closed")
 
+        # Injection state shared between event_loop and opus_loop.
+        # asyncio is single-threaded so plain lists are safe as shared mutables.
+        pending_text_tokens: list = []   # int token IDs queued by event_loop
+        inject_post_silence = [0]        # frames of settling silence after injection
+
+        # --- Per-session SessionManager (None when feature is disabled) ---
+        session_mgr: Optional[SessionManager] = None
+        if self.session_manager_cfg is not None:
+            cfg = self.session_manager_cfg
+            text_prompt_for_session = request.query.get("text_prompt", "")
+            session_mgr = SessionManager(
+                notify_queue=self.notify_queue,
+                text_prompt=text_prompt_for_session,
+                whisper_model_size=cfg.get("whisper_model", "base"),
+                anthropic_api_key=cfg.get("anthropic_key"),
+                device=str(self.device),
+            )
+
         async def opus_loop():
             all_pcm_data = None
+
+            # --- VAD state ---
+            _vad_threshold = 0.015       # RMS energy threshold (float32 [-1,1])
+            _vad_onset_frames = 3        # consecutive speech frames → turn start (~240 ms)
+            _vad_offset_frames = 10      # consecutive silent frames → turn end  (~800 ms)
+            _vad_max_frames = int(30 * self.mimi.frame_rate)  # 30 s hard cap
+            _vad_speech_cnt = 0
+            _vad_silence_cnt = 0
+            _vad_active = False          # currently collecting a user turn
+            _vad_buf: list[np.ndarray] = []
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+
+                # --- Injection: Odin speaks forced text, user side silent ---
+                if pending_text_tokens:
+                    token_id = pending_text_tokens.pop(0)
+                    tokens = self.lm_gen.step(
+                        input_tokens=self.lm_gen._encode_zero_frame(),
+                        text_token=token_id,
+                    )
+                    if tokens is not None:
+                        main_pcm = self.mimi.decode(tokens[:, 1:9])
+                        _ = self.other_mimi.decode(tokens[:, 1:9])
+                        main_pcm = main_pcm.cpu()
+                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        text_token = tokens[0, 0, 0].item()
+                        if text_token not in (0, 3):
+                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                            _text = _text.replace("▁", " ")
+                            await ws.send_bytes(b"\x02" + bytes(_text, encoding="utf8"))
+                    continue
+
+                # --- Post-injection silence: advance LM context without audio output ---
+                if inject_post_silence[0] > 0:
+                    inject_post_silence[0] -= 1
+                    self.lm_gen.step(
+                        input_tokens=self.lm_gen._encode_zero_frame(),
+                        moshi_tokens=self.lm_gen._encode_zero_frame(),
+                        text_token=self.lm_gen.zero_text_code,
+                    )
+                    continue
+
+                # --- Normal path: process incoming user audio ---
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -216,10 +327,44 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
-                    chunk = all_pcm_data[: self.frame_size]
+                    pcm_chunk = all_pcm_data[: self.frame_size]   # numpy float32
                     all_pcm_data = all_pcm_data[self.frame_size:]
-                    chunk = torch.from_numpy(chunk)
+
+                    # --- VAD tee (only when no injection in flight) ---
+                    if session_mgr is not None:
+                        rms = float(np.sqrt(np.mean(pcm_chunk ** 2)))
+                        is_speech = rms > _vad_threshold
+                        if is_speech:
+                            _vad_speech_cnt += 1
+                            _vad_silence_cnt = 0
+                        else:
+                            _vad_silence_cnt += 1
+                            _vad_speech_cnt = 0
+
+                        if not _vad_active and _vad_speech_cnt >= _vad_onset_frames:
+                            _vad_active = True
+                            _vad_buf = []
+                            clog.log("info", "VAD: speech start")
+
+                        if _vad_active:
+                            _vad_buf.append(pcm_chunk.copy())
+                            turn_ended = (
+                                _vad_silence_cnt >= _vad_offset_frames
+                                or len(_vad_buf) >= _vad_max_frames
+                            )
+                            if turn_ended:
+                                turn_pcm = np.concatenate(_vad_buf)
+                                dur = len(turn_pcm) / self.mimi.sample_rate
+                                clog.log("info", f"VAD: turn end ({dur:.1f}s, {len(turn_pcm)} samples)")
+                                asyncio.create_task(
+                                    session_mgr.process_turn(turn_pcm, self.mimi.sample_rate)
+                                )
+                                _vad_active = False
+                                _vad_buf = []
+                                _vad_speech_cnt = 0
+                                _vad_silence_cnt = 0
+
+                    chunk = torch.from_numpy(pcm_chunk)
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
@@ -242,6 +387,7 @@ class ServerState:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
         async def send_loop():
+            last_send_time = time.time()
             while True:
                 if close:
                     return
@@ -249,6 +395,41 @@ class ServerState:
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
+                    last_send_time = time.time()
+                elif time.time() - last_send_time > 5.0:
+                    # Keep-alive ping so the client doesn't time out while Odin listens
+                    await ws.send_bytes(b"\x06")
+                    last_send_time = time.time()
+
+        async def event_loop():
+            """Drains notify_queue and injects Odin speech mid-conversation."""
+            while True:
+                if close:
+                    return
+                try:
+                    text = await asyncio.wait_for(self.notify_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+                # Wait for any in-progress injection to finish before starting the next
+                while pending_text_tokens or inject_post_silence[0] > 0:
+                    await asyncio.sleep(0.02)
+                # Tell the client to mute the mic while Odin speaks
+                try:
+                    await ws.send_bytes(b"\x03\x04")  # control: speaking
+                except Exception:
+                    return
+                token_ids = self.text_tokenizer.encode(text)
+                clog.log("info", f"injecting {len(token_ids)} tokens: {text!r}")
+                pending_text_tokens.extend(token_ids)
+                inject_post_silence[0] = max(1, int(0.3 * self.mimi.frame_rate))
+                # Wait for opus_loop to consume all tokens and settle silence
+                while pending_text_tokens or inject_post_silence[0] > 0:
+                    await asyncio.sleep(0.02)
+                # Tell the client the mic can open again
+                try:
+                    await ws.send_bytes(b"\x03\x05")  # control: listening
+                except Exception:
+                    return
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -292,6 +473,7 @@ class ServerState:
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(opus_loop()),
                     asyncio.create_task(send_loop()),
+                    asyncio.create_task(event_loop()),
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -390,8 +572,31 @@ def main():
             "that contains valid key.pem and cert.pem files"
         )
     )
+    # Session manager / brain options
+    parser.add_argument(
+        "--session-manager",
+        action="store_true",
+        help="Enable per-session ASR (Whisper) + brain LLM (Claude). "
+             "Requires faster-whisper and/or anthropic packages.",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        type=str,
+        default="base",
+        help="faster-whisper model size used for ASR (default: base).",
+    )
+    parser.add_argument(
+        "--anthropic-key",
+        type=str,
+        default=None,
+        help="Anthropic API key for the brain LLM (or set ANTHROPIC_API_KEY env var).",
+    )
 
     args = parser.parse_args()
+
+    # Allow API key from environment
+    if args.anthropic_key is None:
+        args.anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -445,6 +650,15 @@ def main():
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
     logger.info("moshi loaded")
+    session_manager_cfg = None
+    if args.session_manager:
+        session_manager_cfg = {
+            "whisper_model": args.whisper_model,
+            "anthropic_key": args.anthropic_key,
+        }
+        logger.info(f"Session manager enabled (whisper={args.whisper_model}, "
+                    f"brain={'yes' if args.anthropic_key else 'no (no API key)'})")
+
     state = ServerState(
         mimi=mimi,
         other_mimi=other_mimi,
@@ -453,11 +667,14 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        session_manager_cfg=session_manager_cfg,
     )
     logger.info("warming up the model")
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_get("/api/events", state.handle_sse)
+    app.router.add_post("/api/notify", state.handle_notify)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))

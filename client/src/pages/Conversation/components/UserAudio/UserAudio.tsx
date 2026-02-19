@@ -3,14 +3,40 @@ import { useSocketContext } from "../../SocketContext";
 import { useUserAudio } from "../../hooks/useUserAudio";
 import { ClientVisualizer } from "../AudioVisualizer/ClientVisualizer";
 import { type ThemeType } from "../../hooks/useSystemTheme";
+import { decodeMessage } from "../../../../protocol/encoder";
 
 type UserAudioProps = {
   theme: ThemeType;
 };
 export const UserAudio: FC<UserAudioProps> = ({theme}) => {
   const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
-  const { sendMessage, socketStatus } = useSocketContext();
+  const { sendMessage, socketStatus, socket } = useSocketContext();
   const containerRef = useRef<HTMLDivElement>(null);
+  // Muted while Odin is speaking — prevents mic bleed feeding back into the model
+  const isMutedRef = useRef(false);
+
+  // Listen for speaking/listening control messages from the server
+  useEffect(() => {
+    if (!socket) return;
+    const handleMessage = (e: MessageEvent) => {
+      const data = new Uint8Array(e.data);
+      try {
+        const msg = decodeMessage(data);
+        if (msg.type === 'control') {
+          if (msg.action === 'speaking') {
+            isMutedRef.current = true;
+          } else if (msg.action === 'listening') {
+            isMutedRef.current = false;
+          }
+        }
+      } catch {
+        // ignore decode errors
+      }
+    };
+    socket.addEventListener('message', handleMessage);
+    return () => socket.removeEventListener('message', handleMessage);
+  }, [socket]);
+
   const onRecordingStart = useCallback(() => {
     console.log("Recording started");
   }, []);
@@ -21,7 +47,7 @@ export const UserAudio: FC<UserAudioProps> = ({theme}) => {
 
   const onRecordingChunk = useCallback(
     (chunk: Uint8Array) => {
-      if (socketStatus !== "connected") {
+      if (socketStatus !== "connected" || isMutedRef.current) {
         return;
       }
       sendMessage({
