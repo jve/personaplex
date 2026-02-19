@@ -5,6 +5,7 @@ import { useSearchParams } from "react-router-dom";
 import { Conversation } from "../Conversation/Conversation";
 import { Button } from "../../components/Button/Button";
 import { useModelParams } from "../Conversation/hooks/useModelParams";
+import { useNotificationChannel } from "../Conversation/hooks/useNotificationChannel";
 import { env } from "../../env";
 import { prewarmDecoderWorker } from "../../decoder/decoderWorker";
 
@@ -131,6 +132,7 @@ export const Queue:FC = () => {
   const overrideWorkerAddr = searchParams.get("worker_addr");
   const [hasMicrophoneAccess, setHasMicrophoneAccess] = useState<boolean>(false);
   const [showMicrophoneAccessMessage, setShowMicrophoneAccessMessage] = useState<boolean>(false);
+  const [pendingWakeText, setPendingWakeText] = useState<string | null>(null);
   const modelParams = useModelParams();
 
   const audioContext = useRef<AudioContext | null>(null);
@@ -186,9 +188,22 @@ export const Queue:FC = () => {
       await startProcessor();
       const hasAccess = await getMicrophoneAccess();
       if (hasAccess) {
-      // Values are already set in modelParams, they get passed to Conversation
-    }
+        setPendingWakeText(null);
+      }
   }, [startProcessor, getMicrophoneAccess]);
+
+  // SSE notification channel — always-on, zero GPU cost.
+  // When the server fires a wake event (POST /api/notify), either:
+  //   • session is already active → server's event_loop handles it automatically
+  //   • no session yet → show a banner so the user can connect with one click
+  const onWake = useCallback((text: string) => {
+    if (!hasMicrophoneAccess) {
+      setPendingWakeText(text);
+    }
+    // If already connected, the server queued the event; event_loop will speak it.
+  }, [hasMicrophoneAccess]);
+
+  useNotificationChannel(overrideWorkerAddr ?? "", onWake);
 
   return (
     <>
@@ -202,14 +217,26 @@ export const Queue:FC = () => {
         {...modelParams}
         />
       ) : (
-        <Homepage
-          startConnection={startConnection}
-          showMicrophoneAccessMessage={showMicrophoneAccessMessage}
-          textPrompt={modelParams.textPrompt}
-          setTextPrompt={modelParams.setTextPrompt}
-          voicePrompt={modelParams.voicePrompt}
-          setVoicePrompt={modelParams.setVoicePrompt}
-        />
+        <>
+          {pendingWakeText && (
+            <div className="fixed top-0 left-0 right-0 z-50 bg-[#76b900] text-white px-4 py-3 flex items-center justify-between shadow-md">
+              <span className="text-sm font-medium">
+                Odin wants to speak with you
+              </span>
+              <Button onClick={async () => await startConnection()}>
+                Connect
+              </Button>
+            </div>
+          )}
+          <Homepage
+            startConnection={startConnection}
+            showMicrophoneAccessMessage={showMicrophoneAccessMessage}
+            textPrompt={modelParams.textPrompt}
+            setTextPrompt={modelParams.setTextPrompt}
+            voicePrompt={modelParams.voicePrompt}
+            setVoicePrompt={modelParams.setVoicePrompt}
+          />
+        </>
       )}
     </>
   );
